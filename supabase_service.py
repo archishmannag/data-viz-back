@@ -258,7 +258,7 @@ class SupabaseService:
         try:
             response = (
                 self.client.table("service_usage_records")
-                .select("file_names, created_at")
+                .select("id, file_names, created_at")
                 .eq("user_id", user_id)
                 .order("created_at", desc=True)
                 .limit(limit)
