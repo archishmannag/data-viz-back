@@ -8,6 +8,7 @@ import os
 import json
 import pandas as pd
 import time
+import math
 
 import chunker
 from supa import get_current_user_optional
@@ -20,13 +21,29 @@ processing_router = APIRouter(prefix="", tags=["document-processing"])
 system_router = APIRouter(prefix="/system", tags=["system"])
 
 
+def split_string_preserve_words(text: str, n: int) -> list[str]:
+    words = text.split()
+    avg_words = math.ceil(len(words) / n)
+
+    chunks = []
+    for i in range(0, len(words), avg_words):
+        chunk = " ".join(words[i : i + avg_words])
+        chunks.append(chunk)
+
+    # Ensure exactly n chunks (pad last ones if needed)
+    while len(chunks) < n:
+        chunks.append("")
+
+    return chunks
+
+
 def generate_chart_response(content: List[str], num_files: int) -> Dict[str, Any]:
-    new = "\n\n".join(content)
+    combined_content = "\n\n".join(content)
     prompt_text = (
         """
 Retrieved document chunks:
 """
-        + new
+        + combined_content
         + """
 User query:
     Using the above document chunks, create as many charts as possible.
@@ -169,11 +186,37 @@ The data for Sankey must be in the following format in accordance to Recharts:
 }
 """
     )
-
-    prompt_parts = Content(
-        role="user",
-        parts=[Part(text=prompt_text)],
-    )
+    count = client.models.count_tokens(
+        model="gemini-2.0-flash", contents=[prompt_text]
+    ).total_tokens
+    if count and count > 1_000_000:
+        num = count // 1_000_000
+        chunks = split_string_preserve_words(combined_content, num)
+        prompt_parts = [
+            Content(
+                role="user",
+                parts=[Part(text=chunk)],
+            )
+            for chunk in chunks
+        ]
+        prompt_parts.insert(
+            0,
+            Content(
+                role="user",
+                parts=[
+                    Part(
+                        text="I will send the entire prompt in chunks, please wait until I finish sending all the chunks."
+                    )
+                ],
+            ),
+        )
+    else:
+        prompt_parts = [
+            Content(
+                role="user",
+                parts=[Part(text=prompt_text)],
+            )
+        ]
 
     json_pattern = r"(\{.*\})"
     config = GenerateContentConfig(
