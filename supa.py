@@ -3,7 +3,7 @@ FastAPI integration with Supabase authentication and service usage tracking.
 This example shows how to integrate the Supabase service with your existing FastAPI application.
 """
 
-from fastapi import HTTPException, Depends, Form, APIRouter
+from fastapi import HTTPException, Depends, Form, APIRouter, UploadFile
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from gotrue import User
 import jwt
@@ -20,6 +20,7 @@ auth_router = APIRouter(prefix="/auth", tags=["authentication"])
 user_router = APIRouter(prefix="/user", tags=["user"])
 history_router = APIRouter(prefix="/history", tags=["history"])
 analytics_router = APIRouter(prefix="/analytics", tags=["analytics"])
+files_router = APIRouter(prefix="/files", tags=["file-management"])
 
 
 # Dependency to get current user
@@ -218,7 +219,11 @@ async def update_profile(
 @user_router.get("/me")
 async def get_current_user_info(current_user=Depends(get_current_user)):
     """Get current user information"""
-    return {"user_id": current_user.id, "email": current_user.email}
+    return {
+        "user_id": current_user.id,
+        "email": current_user.email,
+        "name": current_user.user_metadata.get("full_name", "N/A"),
+    }
 
 
 # History and analytics endpoints
@@ -312,6 +317,121 @@ async def get_user_stats_summary(current_user=Depends(get_current_user)):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get stats: {str(e)}")
+
+
+# File management endpoints
+@files_router.get("/names")
+async def get_user_file_names(current_user=Depends(get_current_user)):
+    """Get list of file names for reuse in processing"""
+    try:
+        files = await supabase_service.get_user_files(current_user.id)
+
+        # Return simplified list with original and storage names for selection
+        file_options = []
+        for file in files:
+            file_options.append(
+                {
+                    "original_name": file["original_name"],
+                    "storage_name": file["name"],
+                    "size": file["size"],
+                    "created_at": file["created_at"],
+                    "file_type": file["original_name"].split(".")[-1]
+                    if "." in file["original_name"]
+                    else "unknown",
+                }
+            )
+
+        return {
+            "user_id": current_user.id,
+            "available_files": file_options,
+            "total_files": len(file_options),
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Failed to get user file names: {str(e)}"
+        )
+
+
+@files_router.get("/")
+async def get_user_files(current_user=Depends(get_current_user)):
+    """Get list of files uploaded by the current user"""
+    try:
+        files = await supabase_service.get_user_files(current_user.id)
+
+        return {
+            "user_id": current_user.id,
+            "files": files,
+            "total_files": len(files),
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Failed to get user files: {str(e)}"
+        )
+
+
+@files_router.delete("/{file_path:path}")
+async def delete_user_file(
+    file_path: str,
+    current_user=Depends(get_current_user),
+):
+    """Delete a specific file from storage"""
+    try:
+        # Ensure the file path starts with the user's ID for security
+        if not file_path.startswith(f"{current_user.id}/"):
+            raise HTTPException(
+                status_code=403, detail="You can only delete your own files"
+            )
+
+        result = await supabase_service.delete_file(file_path)
+
+        if result["success"]:
+            return {"message": "File deleted successfully", "file_path": file_path}
+        else:
+            raise HTTPException(status_code=400, detail=result["message"])
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to delete file: {str(e)}")
+
+
+@files_router.post("/upload")
+async def upload_file_endpoint(
+    file: UploadFile,
+    current_user=Depends(get_current_user),
+):
+    """Upload a single file to storage"""
+    try:
+        # Read file content
+        content = await file.read()
+        filename = file.filename or "uploaded_file"
+
+        # Upload to storage
+        result = await supabase_service.upload_file(
+            user_id=current_user.id,
+            file_path=filename,
+            file_content=content,
+        )
+
+        if result["success"]:
+            return {
+                "message": "File uploaded successfully",
+                "file_info": {
+                    "original_filename": result["original_filename"],
+                    "storage_path": result["storage_path"],
+                    "public_url": result["public_url"],
+                    "file_size": result["file_size"],
+                },
+            }
+        else:
+            raise HTTPException(status_code=400, detail=result["message"])
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to upload file: {str(e)}")
 
 
 # Test endpoint

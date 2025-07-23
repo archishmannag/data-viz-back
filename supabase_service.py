@@ -5,6 +5,7 @@ Handles authentication, user management, and service usage tracking.
 
 import os
 import asyncio
+import uuid
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any
 from dotenv import load_dotenv
@@ -406,6 +407,294 @@ class SupabaseService:
             logger.error(f"Database initialization error: {e}")
             return {"success": False, "message": str(e)}
 
+    # File Storage Methods
+    async def upload_file(
+        self,
+        user_id: str,
+        file_path: str,
+        file_content: bytes,
+        bucket_name: str = "user-files",
+    ) -> Dict[str, Any]:
+        """
+        Upload a file to Supabase storage
+
+        Args:
+            user_id: User ID
+            file_path: Original file path/name
+            file_content: File content as bytes
+            bucket_name: Storage bucket name
+
+        Returns:
+            Dict containing upload result and file info
+        """
+        try:
+            # Generate unique filename with user ID prefix and timestamp
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            unique_id = str(uuid.uuid4())[:8]
+            storage_filename = (
+                f"{user_id}/{timestamp}_{unique_id}_{os.path.basename(file_path)}"
+            )
+
+            # Upload file to storage
+            response = self.client.storage.from_(bucket_name).upload(
+                storage_filename, file_content
+            )
+
+            if response:
+                # Get public URL for the file
+                public_url = self.client.storage.from_(bucket_name).get_public_url(
+                    storage_filename
+                )
+
+                logger.info(f"File uploaded successfully: {storage_filename}")
+                return {
+                    "success": True,
+                    "storage_path": storage_filename,
+                    "public_url": public_url,
+                    "original_filename": os.path.basename(file_path),
+                    "file_size": len(file_content),
+                    "upload_timestamp": datetime.now(timezone.utc).isoformat(),
+                    "message": "File uploaded successfully",
+                }
+            else:
+                return {"success": False, "message": "Failed to upload file"}
+        except Exception as e:
+            logger.error(f"File upload error: {e}")
+            return {"success": False, "message": str(e)}
+
+    async def upload_multiple_files(
+        self,
+        user_id: str,
+        files_data: List[Dict[str, Any]],
+        bucket_name: str = "user-files",
+    ) -> List[Dict[str, Any]]:
+        """
+        Upload multiple files concurrently
+
+        Args:
+            user_id: User ID
+            files_data: List of dicts with 'path' and 'content' keys
+            bucket_name: Storage bucket name
+
+        Returns:
+            List of upload results
+        """
+        upload_tasks = []
+
+        for file_data in files_data:
+            task = self.upload_file(
+                user_id=user_id,
+                file_path=file_data["path"],
+                file_content=file_data["content"],
+                bucket_name=bucket_name,
+            )
+            upload_tasks.append(task)
+
+        # Execute all uploads concurrently
+        results = await asyncio.gather(*upload_tasks, return_exceptions=True)
+
+        # Handle any exceptions that occurred during upload
+        processed_results = []
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                logger.error(
+                    f"File upload failed for {files_data[i]['path']}: {result}"
+                )
+                processed_results.append(
+                    {
+                        "success": False,
+                        "original_filename": os.path.basename(files_data[i]["path"]),
+                        "message": str(result),
+                    }
+                )
+            else:
+                processed_results.append(result)
+
+        return processed_results
+
+    async def delete_file(
+        self, storage_path: str, bucket_name: str = "user-files"
+    ) -> Dict[str, Any]:
+        """
+        Delete a file from Supabase storage
+
+        Args:
+            storage_path: Path of the file in storage
+            bucket_name: Storage bucket name
+
+        Returns:
+            Dict containing deletion result
+        """
+        try:
+            response = self.client.storage.from_(bucket_name).remove([storage_path])
+
+            if response:
+                logger.info(f"File deleted successfully: {storage_path}")
+                return {"success": True, "message": "File deleted successfully"}
+            else:
+                return {"success": False, "message": "Failed to delete file"}
+        except Exception as e:
+            logger.error(f"File deletion error: {e}")
+            return {"success": False, "message": str(e)}
+
+    async def download_file(
+        self, storage_path: str, bucket_name: str = "user-files"
+    ) -> Dict[str, Any]:
+        """
+        Download a file from Supabase storage
+
+        Args:
+            storage_path: Path of the file in storage
+            bucket_name: Storage bucket name
+
+        Returns:
+            Dict containing file content and metadata
+        """
+        try:
+            response = self.client.storage.from_(bucket_name).download(storage_path)
+
+            if response:
+                logger.info(f"File downloaded successfully: {storage_path}")
+                return {
+                    "success": True,
+                    "content": response,
+                    "storage_path": storage_path,
+                    "message": "File downloaded successfully",
+                }
+            else:
+                return {"success": False, "message": "Failed to download file"}
+
+        except Exception as e:
+            logger.error(f"File download error: {e}")
+            return {"success": False, "message": str(e)}
+
+    async def get_user_files(
+        self, user_id: str, bucket_name: str = "user-files", limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        """
+        Get list of files uploaded by a user
+
+        Args:
+            user_id: User ID
+            bucket_name: Storage bucket name
+            limit: Maximum number of files to return
+
+        Returns:
+            List of file information
+        """
+        try:
+            # List files in user's directory
+            response = self.client.storage.from_(bucket_name).list(
+                f"{user_id}/",
+                {"limit": limit, "sortBy": {"column": "created_at", "order": "desc"}},
+            )
+
+            if response:
+                files = []
+                for file_info in response:
+                    # Skip if empty placeholder file from supa
+                    if file_info["name"] == ".emptyFolderPlaceholder":
+                        continue
+                    # Safely handle metadata field
+                    metadata = file_info.get("metadata", {})
+                    file_size = 0
+                    if isinstance(metadata, dict):
+                        file_size = metadata.get("size", 0)
+
+                    # Extract original filename from storage filename
+                    storage_name = file_info["name"]
+                    # Storage format: timestamp_uuid_originalname.ext
+                    parts = storage_name.split("_", 3)
+                    original_name = parts[3] if len(parts) >= 4 else storage_name
+
+                    files.append(
+                        {
+                            "name": file_info["name"],
+                            "original_name": original_name,
+                            "storage_path": f"{user_id}/{file_info['name']}",
+                            "size": file_size,
+                            "created_at": file_info.get("created_at"),
+                            "updated_at": file_info.get("updated_at"),
+                            "public_url": self.client.storage.from_(
+                                bucket_name
+                            ).get_public_url(f"{user_id}/{file_info['name']}"),
+                        }
+                    )
+                return files
+            else:
+                return []
+
+        except Exception as e:
+            logger.error(f"Get user files error: {e}")
+            return []
+
+    async def get_user_files_with_content(
+        self, user_id: str, file_names: List[str], bucket_name: str = "user-files"
+    ) -> List[Dict[str, Any]]:
+        """
+        Get specific files by their storage names with content
+
+        Args:
+            user_id: User ID
+            file_names: List of storage file names to retrieve
+            bucket_name: Storage bucket name
+
+        Returns:
+            List of file data with content
+        """
+        try:
+            download_tasks = []
+
+            for file_name in file_names:
+                storage_path = f"{user_id}/{file_name}"
+                task = self.download_file(storage_path, bucket_name)
+                download_tasks.append(task)
+
+            # Execute all downloads concurrently
+            results = await asyncio.gather(*download_tasks, return_exceptions=True)
+
+            # Process results
+            files_data = []
+            for i, result in enumerate(results):
+                if isinstance(result, Exception):
+                    logger.error(f"Failed to download {file_names[i]}: {result}")
+                    files_data.append(
+                        {
+                            "success": False,
+                            "storage_name": file_names[i],
+                            "message": str(result),
+                        }
+                    )
+                elif isinstance(result, dict) and result.get("success"):
+                    files_data.append(
+                        {
+                            "success": True,
+                            "storage_name": file_names[i],
+                            "content": result["content"],
+                            "storage_path": result["storage_path"],
+                        }
+                    )
+                else:
+                    message = "Unknown error"
+                    if isinstance(result, dict):
+                        message = result.get("message", "Unknown error")
+                    files_data.append(
+                        {
+                            "success": False,
+                            "storage_name": file_names[i],
+                            "message": message,
+                        }
+                    )
+
+            return files_data
+
+        except Exception as e:
+            logger.error(f"Get user files with content error: {e}")
+            return [
+                {"success": False, "storage_name": name, "message": str(e)}
+                for name in file_names
+            ]
+
 
 # Global service instance
 supabase_service = SupabaseService()
@@ -441,6 +730,25 @@ async def get_user_history(
 ) -> List[Dict[str, Any]]:
     """Convenience function to get user history"""
     return await supabase_service.get_user_service_records(user_id, limit, offset)
+
+
+async def upload_user_files(
+    user_id: str, files_data: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Convenience function to upload multiple files for a user"""
+    return await supabase_service.upload_multiple_files(user_id, files_data)
+
+
+async def upload_user_file(
+    user_id: str, file_path: str, file_content: bytes
+) -> Dict[str, Any]:
+    """Convenience function to upload a single file for a user"""
+    return await supabase_service.upload_file(user_id, file_path, file_content)
+
+
+async def get_user_uploaded_files(user_id: str) -> List[Dict[str, Any]]:
+    """Convenience function to get user's uploaded files"""
+    return await supabase_service.get_user_files(user_id)
 
 
 if __name__ == "__main__":

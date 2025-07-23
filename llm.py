@@ -9,6 +9,7 @@ import json
 import pandas as pd
 import time
 import math
+import asyncio
 
 import chunker
 from supa import get_current_user_optional
@@ -19,6 +20,39 @@ client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 # Create router
 processing_router = APIRouter(prefix="", tags=["document-processing"])
 system_router = APIRouter(prefix="/system", tags=["system"])
+
+
+async def upload_files_to_storage(
+    user_id: str, files_data: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """
+    Upload files to Supabase storage asynchronously
+
+    Args:
+        user_id: User ID
+        files_data: List of file data with 'path' and 'content' keys
+
+    Returns:
+        List of upload results
+    """
+    if not files_data:
+        return []
+
+    try:
+        upload_results = await supabase_service.upload_multiple_files(
+            user_id=user_id, files_data=files_data
+        )
+        return upload_results
+    except Exception as e:
+        print(f"Error uploading files to storage: {str(e)}")
+        return [
+            {
+                "success": False,
+                "message": str(e),
+                "original_filename": file_data.get("path", "unknown"),
+            }
+            for file_data in files_data
+        ]
 
 
 def split_string_preserve_words(text: str, n: int) -> list[str]:
@@ -250,8 +284,6 @@ Instructions:
     response = client.models.generate_content(
         model="gemini-2.0-flash", contents=prompt_parts, config=config
     )
-    with open("response.json", "w") as f:
-        f.write(str(response.text))
     result: Dict[str, Any] = {}
     if response.text:
         json_match = re.search(json_pattern, response.text, re.DOTALL)
@@ -271,7 +303,7 @@ def process_pdf(file_path: str) -> List[str]:
 
     for page_num in range(len(doc)):
         page = doc[page_num]
-        text = page.get_text("text")
+        text = page.get_text()  # type: ignore - PyMuPDF method
         pages.append(text)
     text = ""
     for raw in pages:
@@ -340,33 +372,82 @@ def process_excel(file_path: str) -> List[str]:
 
 @processing_router.post("/generate")
 async def generate_response(
-    files: list[UploadFile], current_user=Depends(get_current_user_optional)
+    files: List[UploadFile] = [],
+    existing_files: str = "[]",  # JSON string of existing file names
+    current_user=Depends(get_current_user_optional),
 ):
-    """Generate a response based on the uploaded files.
+    """Generate a response based on uploaded files and/or existing files.
 
     Args:
-        files (list[UploadFile]): The files to process.
+        files (List[UploadFile]): New files to process and upload.
+        existing_files (str): JSON string array of storage names of existing files to reuse.
     """
     start_time = time.time()
+
+    # Parse existing files from JSON string
+    try:
+        existing_file_list = json.loads(existing_files) if existing_files else []
+        if not isinstance(existing_file_list, list):
+            existing_file_list = []
+    except json.JSONDecodeError:
+        existing_file_list = []
 
     file_locations = []
     file_names = []
     file_sizes = []
+    files_content = []  # Store file content for storage upload
+    file_name_mapping = {}  # Map original names to storage names
 
+    # Process new uploaded files
     for i, file in enumerate(files):
         filename = file.filename or f"uploaded_file_{i}"
         file_location = f"/tmp/{filename}"
         file_locations.append(file_location)
         file_names.append(filename)
 
-    # Save files and track sizes
+    # Save new files and track sizes
     for i, file_location in enumerate(file_locations):
         content = await files[i].read()
         file_sizes.append(len(content))
+        files_content.append({"path": file_location, "content": content})
         with open(file_location, "wb") as f:
             f.write(content)
 
-    # Process files
+    # Process existing files from storage (if user is authenticated)
+    existing_file_data = []
+    if current_user and existing_file_list:
+        try:
+            existing_file_data = await supabase_service.get_user_files_with_content(
+                current_user.id, existing_file_list
+            )
+
+            # Save existing files to temp locations for processing
+            for file_data in existing_file_data:
+                if file_data.get("success") and file_data.get("content"):
+                    storage_name = file_data["storage_name"]
+                    # Extract original name from storage name (timestamp_uuid_originalname.ext)
+                    parts = storage_name.split("_", 2)
+                    original_name = parts[2] if len(parts) >= 3 else storage_name
+
+                    temp_location = f"/tmp/existing_{original_name}"
+                    file_locations.append(temp_location)
+                    file_names.append(original_name)
+                    file_sizes.append(len(file_data["content"]))
+
+                    # Save to temp file for processing
+                    with open(temp_location, "wb") as f:
+                        f.write(file_data["content"])
+
+                    # Track the mapping
+                    file_name_mapping[original_name] = storage_name
+                else:
+                    print(
+                        f"Failed to retrieve existing file: {file_data.get('storage_name', 'unknown')}"
+                    )
+        except Exception as e:
+            print(f"Error retrieving existing files: {str(e)}")
+
+    # Process files for text extraction
     text_chunks: List[str] = []
     for file_location in file_locations:
         text_chunks.append(f"File: {file_location}\n")
@@ -375,29 +456,122 @@ async def generate_response(
         elif file_location.endswith(".xlsx") or file_location.endswith(".xls"):
             text_chunks.extend(process_excel(file_location))
 
-    # Generate AI response
-    var = generate_chart_response(text_chunks, len(files))
+    # Create tasks for parallel execution
+    tasks = []
+
+    # Task 1: Generate AI response
+    ai_response_task = asyncio.create_task(
+        asyncio.to_thread(generate_chart_response, text_chunks, len(file_locations))
+    )
+    tasks.append(ai_response_task)
+
+    # Task 2: Upload NEW files to storage (only if user is authenticated and there are new files)
+    upload_task = None
+    if current_user and files_content:  # Only upload new files, not existing ones
+        upload_task = asyncio.create_task(
+            upload_files_to_storage(current_user.id, files_content)
+        )
+        tasks.append(upload_task)
+
+    # Execute tasks in parallel
+    if upload_task:
+        # Wait for both AI response and file upload
+        results = await asyncio.gather(
+            ai_response_task, upload_task, return_exceptions=True
+        )
+        ai_response, upload_results = results
+
+        # Handle upload results (log any errors but don't fail the request)
+        if isinstance(upload_results, Exception):
+            print(f"File upload failed: {upload_results}")
+            upload_results = []
+        elif upload_results and isinstance(upload_results, list):
+            successful_uploads = [r for r in upload_results if r.get("success", False)]
+            failed_uploads = [r for r in upload_results if not r.get("success", False)]
+
+            if successful_uploads:
+                print(
+                    f"Successfully uploaded {len(successful_uploads)} files to storage"
+                )
+            if failed_uploads:
+                print(f"Failed to upload {len(failed_uploads)} files to storage")
+        else:
+            upload_results = []
+    else:
+        # Only wait for AI response if no user is logged in
+        ai_response = await ai_response_task
+        upload_results = []
+
+    # Handle AI response result
+    if isinstance(ai_response, Exception):
+        print(f"AI response generation failed: {ai_response}")
+        ai_response = {"error": "Failed to generate response"}
 
     # Calculate processing time
     processing_time = time.time() - start_time
 
     # Track service usage if user is authenticated
-    if current_user:
+    if current_user and isinstance(ai_response, dict):
+        # Calculate upload statistics safely
+        files_uploaded = 0
+        upload_errors = 0
+        if upload_results and isinstance(upload_results, list):
+            files_uploaded = len([r for r in upload_results if r.get("success", False)])
+            upload_errors = len(
+                [r for r in upload_results if not r.get("success", False)]
+            )
+
+        # Create comprehensive file mapping for metadata
+        all_file_info = []
+
+        # Add new uploaded files
+        for i, filename in enumerate(file_names[: len(files)]):  # Only new files
+            file_info = {
+                "original_name": filename,
+                "type": "new_upload",
+                "size": file_sizes[i] if i < len(file_sizes) else 0,
+                "file_type": filename.split(".")[-1] if "." in filename else "unknown",
+            }
+            # Add storage name if upload was successful
+            if (
+                upload_results
+                and i < len(upload_results)
+                and upload_results[i].get("success")
+            ):
+                file_info["storage_name"] = (
+                    upload_results[i].get("storage_path", "").split("/")[-1]
+                )
+                file_info["storage_path"] = upload_results[i].get("storage_path", "")
+            all_file_info.append(file_info)
+
+        # Add existing reused files
+        for filename in file_names[len(files) :]:  # Only existing files
+            file_info = {
+                "original_name": filename,
+                "storage_name": file_name_mapping.get(filename, ""),
+                "type": "reused_file",
+                "file_type": filename.split(".")[-1] if "." in filename else "unknown",
+            }
+            all_file_info.append(file_info)
+
         metadata = {
             "processing_time_seconds": processing_time,
             "file_sizes_bytes": file_sizes,
-            "total_files": len(files),
+            "total_files": len(file_locations),
+            "new_files_count": len(files),
+            "reused_files_count": len(existing_file_list),
             "endpoint": "/processing/generate",
-            "file_types": [
-                f.split(".")[-1] if "." in f else "unknown" for f in file_names
-            ],
+            "files_info": all_file_info,  # Comprehensive file information
+            "file_types": [info["file_type"] for info in all_file_info],
+            "files_uploaded_to_storage": files_uploaded,
+            "storage_upload_errors": upload_errors,
         }
 
         await supabase_service.create_service_record(
-            current_user.id, file_names, var, metadata
+            current_user.id, file_names, ai_response, metadata
         )
 
-    return var
+    return ai_response
 
 
 @system_router.get("/health")

@@ -4,7 +4,13 @@ from starlette.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 
 # Import routers
-from supa import auth_router, user_router, history_router, analytics_router
+from supa import (
+    auth_router,
+    user_router,
+    history_router,
+    analytics_router,
+    files_router,
+)
 from llm import processing_router, system_router
 
 load_dotenv()
@@ -48,6 +54,7 @@ app.include_router(auth_router)
 app.include_router(user_router)
 app.include_router(history_router)
 app.include_router(analytics_router)
+app.include_router(files_router)
 app.include_router(processing_router)
 app.include_router(system_router)
 
