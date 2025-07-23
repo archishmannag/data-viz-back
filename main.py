@@ -11,7 +11,7 @@ from supa import (
     analytics_router,
     files_router,
 )
-from llm import processing_router, system_router
+from llm import processing_router, system_router, visualization_router
 
 load_dotenv()
 
@@ -57,6 +57,7 @@ app.include_router(analytics_router)
 app.include_router(files_router)
 app.include_router(processing_router)
 app.include_router(system_router)
+app.include_router(visualization_router)
 
 
 @app.get("/")

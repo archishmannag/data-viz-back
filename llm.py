@@ -1,4 +1,4 @@
-from fastapi import APIRouter, UploadFile, Depends
+from fastapi import APIRouter, UploadFile, Depends, Form
 from google import genai
 from google.genai.types import Content, Part, GenerateContentConfig
 from typing import Dict, Any, List
@@ -20,6 +20,7 @@ client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 # Create router
 processing_router = APIRouter(prefix="", tags=["document-processing"])
 system_router = APIRouter(prefix="/system", tags=["system"])
+visualization_router = APIRouter(prefix="/visualization", tags=["visualization"])
 
 
 async def upload_files_to_storage(
@@ -373,7 +374,7 @@ def process_excel(file_path: str) -> List[str]:
 @processing_router.post("/generate")
 async def generate_response(
     files: List[UploadFile] = [],
-    existing_files: str = "[]",  # JSON string of existing file names
+    existing_files: str = Form("[]"),  # JSON string of existing file names
     current_user=Depends(get_current_user_optional),
 ):
     """Generate a response based on uploaded files and/or existing files.
@@ -426,8 +427,8 @@ async def generate_response(
                 if file_data.get("success") and file_data.get("content"):
                     storage_name = file_data["storage_name"]
                     # Extract original name from storage name (timestamp_uuid_originalname.ext)
-                    parts = storage_name.split("_", 2)
-                    original_name = parts[2] if len(parts) >= 3 else storage_name
+                    parts = storage_name.split("_", 3)
+                    original_name = parts[3] if len(parts) >= 4 else storage_name
 
                     temp_location = f"/tmp/existing_{original_name}"
                     file_locations.append(temp_location)
@@ -509,7 +510,7 @@ async def generate_response(
 
     # Calculate processing time
     processing_time = time.time() - start_time
-
+    record = None
     # Track service usage if user is authenticated
     if current_user and isinstance(ai_response, dict):
         # Calculate upload statistics safely
@@ -567,11 +568,62 @@ async def generate_response(
             "storage_upload_errors": upload_errors,
         }
 
-        await supabase_service.create_service_record(
-            current_user.id, file_names, ai_response, metadata
-        )
+        record = (
+            await supabase_service.create_service_record(
+                current_user.id, file_names, ai_response, metadata
+            )
+        ).get("record", None)
 
-    return ai_response
+    return {
+        "ai_response": ai_response,
+        "share_id": record.get("share_id", None) if record else None,
+    }
+
+
+@visualization_router.get("/{share_id}")
+async def get_visualization(share_id: str):
+    """
+    Get a visualization by its unique share_id
+
+    Args:
+        share_id: The unique share ID of the visualization
+
+    Returns:
+        Dict containing ai_response and share_id, or 404 if not found
+    """
+    try:
+        # Get the service record by share_id
+        record = await supabase_service.get_service_record_by_share_id(share_id)
+
+        if not record:
+            from fastapi import HTTPException
+
+            raise HTTPException(
+                status_code=404,
+                detail=f"Visualization with share_id '{share_id}' not found",
+            )
+
+        # Return the same format as /generate endpoint
+        return {
+            "ai_response": record.get("ai_response", {}),
+            "share_id": record.get("share_id", share_id),
+            "metadata": {
+                "created_at": record.get("created_at"),
+                "user_id": record.get("user_id"),
+                "file_names": record.get("file_names", []),
+                "processing_info": record.get("metadata", {}),
+            },
+        }
+
+    except Exception as e:
+        if "HTTPException" in str(type(e)):
+            raise  # Re-raise HTTP exceptions
+
+        from fastapi import HTTPException
+
+        raise HTTPException(
+            status_code=500, detail=f"Error retrieving visualization: {str(e)}"
+        )
 
 
 @system_router.get("/health")

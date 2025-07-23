@@ -287,6 +287,38 @@ class SupabaseService:
             logger.error(f"Get service record error: {e}")
             return None
 
+    async def get_service_record_by_share_id(
+        self, share_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Get a service record by its unique share_id
+
+        Args:
+            share_id: The unique share ID of the record
+
+        Returns:
+            Service record data or None if not found
+        """
+        try:
+            response = (
+                self.client.table("service_usage_records")
+                .select("*")
+                .eq("share_id", share_id)
+                .single()
+                .execute()
+            )
+
+            if response.data:
+                logger.info(f"Service record found for share_id: {share_id}")
+                return response.data
+            else:
+                logger.info(f"No service record found for share_id: {share_id}")
+                return None
+
+        except Exception as e:
+            logger.error(f"Error getting service record by share_id {share_id}: {e}")
+            return None
+
     async def update_service_record(
         self, record_id: str, update_data: Dict[str, Any]
     ) -> Dict[str, Any]:
@@ -749,6 +781,11 @@ async def upload_user_file(
 async def get_user_uploaded_files(user_id: str) -> List[Dict[str, Any]]:
     """Convenience function to get user's uploaded files"""
     return await supabase_service.get_user_files(user_id)
+
+
+async def get_visualization_by_share_id(share_id: str) -> Optional[Dict[str, Any]]:
+    """Convenience function to get visualization by share_id"""
+    return await supabase_service.get_service_record_by_share_id(share_id)
 
 
 if __name__ == "__main__":
