@@ -1,7 +1,7 @@
 from fastapi import APIRouter, UploadFile, Depends, Form
 from google import genai
 from google.genai.types import Content, Part, GenerateContentConfig
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
 import fitz  # PyMuPDF
 import re
 import os
@@ -10,10 +10,15 @@ import pandas as pd
 import time
 import math
 import asyncio
+import logging
 
 import chunker
 from supa import get_current_user_optional
 from supabase_service import supabase_service
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
@@ -21,6 +26,169 @@ client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 processing_router = APIRouter(prefix="", tags=["document-processing"])
 system_router = APIRouter(prefix="/system", tags=["system"])
 visualization_router = APIRouter(prefix="/visualization", tags=["visualization"])
+
+
+# Exception types for different error scenarios
+class QuotaExceededException(Exception):
+    """Raised when API quota is exceeded"""
+
+    pass
+
+
+class RetryableException(Exception):
+    """Raised for errors that can be retried"""
+
+    pass
+
+
+def is_quota_exceeded_error(error: Exception) -> bool:
+    """
+    Check if the error indicates quota exceeded or billing issues
+
+    Args:
+        error: The exception to check
+
+    Returns:
+        bool: True if error indicates quota/billing issues
+    """
+    error_str = str(error).lower()
+    quota_indicators = [
+        "quota exceeded",
+        "insufficient quota",
+        "billing",
+        "quota_exceeded",
+        "resource_exhausted",
+        "too many requests",
+    ]
+    return any(indicator in error_str for indicator in quota_indicators)
+
+
+def is_retryable_error(error: Exception) -> bool:
+    """
+    Check if the error is retryable (temporary issues)
+
+    Args:
+        error: The exception to check
+
+    Returns:
+        bool: True if error can be retried
+    """
+    if is_quota_exceeded_error(error):
+        return False
+
+    error_str = str(error).lower()
+    retryable_indicators = [
+        "timeout",
+        "connection",
+        "network",
+        "unavailable",
+        "internal error",
+        "server error",
+        "503",
+        "502",
+        "500",
+        "overloaded",
+        "rate limit",
+        "temporarily unavailable",
+    ]
+    return any(indicator in error_str for indicator in retryable_indicators)
+
+
+async def cleanup_uploaded_files(upload_results: List[Dict[str, Any]]) -> None:
+    """
+    Clean up uploaded files from storage when quota is exceeded
+
+    Args:
+        upload_results: List of upload results containing storage paths
+    """
+    if not upload_results:
+        return
+
+    logger.info("Cleaning up uploaded files due to quota exceeded error...")
+
+    for result in upload_results:
+        if result.get("success") and result.get("storage_path"):
+            try:
+                storage_path = result["storage_path"]
+                delete_result = await supabase_service.delete_file(storage_path)
+                if delete_result.get("success"):
+                    logger.info(f"Successfully deleted file: {storage_path}")
+                else:
+                    logger.error(
+                        f"Failed to delete file {storage_path}: {delete_result.get('message')}"
+                    )
+            except Exception as e:
+                logger.error(
+                    f"Error deleting file {result.get('storage_path')}: {str(e)}"
+                )
+
+
+async def generate_chart_response_with_retry(
+    content: List[str], num_files: int, max_retries: int = 3, base_delay: float = 1.0
+) -> Tuple[Dict[str, Any], bool]:
+    """
+    Generate chart response with retry logic and exponential backoff
+
+    Args:
+        content: List of content strings
+        num_files: Number of files
+        max_retries: Maximum number of retry attempts
+        base_delay: Base delay between retries in seconds
+
+    Returns:
+        Tuple of (response_dict, is_quota_exceeded)
+    """
+    last_exception = None
+
+    for attempt in range(max_retries + 1):  # +1 for initial attempt
+        try:
+            logger.info(
+                f"AI response generation attempt {attempt + 1}/{max_retries + 1}"
+            )
+            response = generate_chart_response(content, num_files)
+            logger.info("AI response generated successfully")
+            return response, False
+
+        except Exception as e:
+            last_exception = e
+            logger.error(f"Attempt {attempt + 1} failed: {str(e)}")
+
+            # Check if quota exceeded
+            if is_quota_exceeded_error(e):
+                logger.error("Quota exceeded - cannot retry")
+                return {
+                    "error": "quota_exceeded",
+                    "message": "API quota exceeded. Please try again later or upgrade your plan.",
+                    "details": str(e),
+                }, True
+
+            # Check if retryable
+            if not is_retryable_error(e):
+                logger.error(f"Non-retryable error: {str(e)}")
+                return {
+                    "error": "non_retryable",
+                    "message": "An error occurred that cannot be retried.",
+                    "details": str(e),
+                }, False
+
+            # If this is the last attempt, don't wait
+            if attempt == max_retries:
+                break
+
+            # Exponential backoff with jitter
+            delay = base_delay * (2**attempt) + (0.1 * attempt)  # Add small jitter
+            logger.info(f"Retrying in {delay:.1f} seconds...")
+            await asyncio.sleep(delay)
+
+    # All attempts failed
+    logger.error(
+        f"All {max_retries + 1} attempts failed. Last error: {str(last_exception)}"
+    )
+    return {
+        "error": "max_retries_exceeded",
+        "message": f"Failed to generate response after {max_retries + 1} attempts.",
+        "details": str(last_exception) if last_exception else "Unknown error",
+    }, False
 
 
 async def upload_files_to_storage(
@@ -45,7 +213,7 @@ async def upload_files_to_storage(
         )
         return upload_results
     except Exception as e:
-        print(f"Error uploading files to storage: {str(e)}")
+        logger.error(f"Error uploading files to storage: {str(e)}")
         return [
             {
                 "success": False,
@@ -366,7 +534,7 @@ def process_excel(file_path: str) -> List[str]:
 
         return chunks
     except Exception as e:
-        print(f"Error processing Excel file: {str(e)}")
+        logger.error(f"Error processing Excel file: {str(e)}")
         # Return empty list on error instead of trying text processing
         return []
 
@@ -442,11 +610,11 @@ async def generate_response(
                     # Track the mapping
                     file_name_mapping[original_name] = storage_name
                 else:
-                    print(
+                    logger.warning(
                         f"Failed to retrieve existing file: {file_data.get('storage_name', 'unknown')}"
                     )
         except Exception as e:
-            print(f"Error retrieving existing files: {str(e)}")
+            logger.error(f"Error retrieving existing files: {str(e)}")
 
     # Process files for text extraction
     text_chunks: List[str] = []
@@ -460,9 +628,9 @@ async def generate_response(
     # Create tasks for parallel execution
     tasks = []
 
-    # Task 1: Generate AI response
+    # Task 1: Generate AI response with retry logic
     ai_response_task = asyncio.create_task(
-        asyncio.to_thread(generate_chart_response, text_chunks, len(file_locations))
+        generate_chart_response_with_retry(text_chunks, len(file_locations))
     )
     tasks.append(ai_response_task)
 
@@ -480,39 +648,96 @@ async def generate_response(
         results = await asyncio.gather(
             ai_response_task, upload_task, return_exceptions=True
         )
-        ai_response, upload_results = results
+        ai_response_result, upload_results = results
 
         # Handle upload results (log any errors but don't fail the request)
         if isinstance(upload_results, Exception):
-            print(f"File upload failed: {upload_results}")
+            logger.error(f"File upload failed: {upload_results}")
             upload_results = []
         elif upload_results and isinstance(upload_results, list):
             successful_uploads = [r for r in upload_results if r.get("success", False)]
             failed_uploads = [r for r in upload_results if not r.get("success", False)]
 
             if successful_uploads:
-                print(
+                logger.info(
                     f"Successfully uploaded {len(successful_uploads)} files to storage"
                 )
             if failed_uploads:
-                print(f"Failed to upload {len(failed_uploads)} files to storage")
+                logger.warning(
+                    f"Failed to upload {len(failed_uploads)} files to storage"
+                )
         else:
             upload_results = []
     else:
         # Only wait for AI response if no user is logged in
-        ai_response = await ai_response_task
+        ai_response_result = await ai_response_task
         upload_results = []
 
     # Handle AI response result
-    if isinstance(ai_response, Exception):
-        print(f"AI response generation failed: {ai_response}")
+    if isinstance(ai_response_result, Exception):
+        logger.error(f"AI response generation failed: {ai_response_result}")
         ai_response = {"error": "Failed to generate response"}
+        is_quota_exceeded = False
+    elif isinstance(ai_response_result, tuple) and len(ai_response_result) == 2:
+        ai_response, is_quota_exceeded = ai_response_result
+    else:
+        # Fallback for unexpected result format
+        ai_response = (
+            ai_response_result if ai_response_result else {"error": "Unknown error"}
+        )
+        is_quota_exceeded = False
+
+    # Handle quota exceeded case - cleanup uploaded files
+    if is_quota_exceeded and upload_results:
+        logger.warning("Quota exceeded - cleaning up uploaded files")
+        await cleanup_uploaded_files(upload_results)
+        # Clear upload results since files were deleted
+        upload_results = []
+
+        # Return quota error immediately
+        from fastapi import HTTPException
+
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "error": "quota_exceeded",
+                "message": "API quota exceeded. Please try again later or upgrade your plan.",
+                "uploaded_files_cleaned": True,
+            },
+        )
+
+    # Handle other AI response errors
+    if isinstance(ai_response, dict) and ai_response.get("error"):
+        error_type = ai_response.get("error")
+        if error_type in ["max_retries_exceeded", "non_retryable"]:
+            # For serious errors, we should also clean up uploaded files
+            if upload_results:
+                logger.warning(
+                    f"AI response failed with {error_type} - cleaning up uploaded files"
+                )
+                await cleanup_uploaded_files(upload_results)
+                upload_results = []
+
+            from fastapi import HTTPException
+
+            status_code = 503 if error_type == "max_retries_exceeded" else 500
+            raise HTTPException(
+                status_code=status_code,
+                detail={
+                    "error": error_type,
+                    "message": ai_response.get(
+                        "message", "AI response generation failed"
+                    ),
+                    "details": ai_response.get("details"),
+                    "uploaded_files_cleaned": bool(upload_results),
+                },
+            )
 
     # Calculate processing time
     processing_time = time.time() - start_time
     record = None
-    # Track service usage if user is authenticated
-    if current_user and isinstance(ai_response, dict):
+    # Track service usage if user is authenticated and response is successful
+    if current_user and isinstance(ai_response, dict) and not ai_response.get("error"):
         # Calculate upload statistics safely
         files_uploaded = 0
         upload_errors = 0
